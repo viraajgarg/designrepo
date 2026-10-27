@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime, timezone
@@ -25,12 +26,14 @@ class DesignService:
     def create(self, payload: DesignCreate, uploads: list[UploadFile]) -> DesignDetail:
         if not 1 <= len(uploads) <= 7:
             raise HTTPException(status_code=422, detail="A design must have between 1 and 7 images")
-        image_paths = self._save_uploads(uploads)
+        image_paths: list[Path] = []
+        created_paths: list[Path] = []
         now = datetime.now(timezone.utc)
         try:
             with self.db.begin():
                 if self.repository.latest_for_update(payload.design_num_id) is not None:
                     raise HTTPException(status_code=409, detail="DESIGN_NUM_ID already exists")
+                image_paths, created_paths = self._save_uploads(uploads, payload.design_num_id)
                 design = DesignDetail(
                     design_num_id=payload.design_num_id,
                     filing_date=payload.filing_date,
@@ -49,7 +52,7 @@ class DesignService:
                 self._add_children(design.id, payload, image_paths, now, version=1)
                 design_id = design.id
         except Exception:
-            self._remove_files(image_paths)
+            self._remove_files(created_paths)
             raise
         return self._get_design(design_id)
 
@@ -186,22 +189,36 @@ class DesignService:
         ])
 
     @staticmethod
-    def _save_uploads(uploads: list[UploadFile]) -> list[Path]:
+    def _save_uploads(
+        uploads: list[UploadFile], design_num_id: str
+    ) -> tuple[list[Path], list[Path]]:
         IMAGE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-        saved: list[Path] = []
+        image_paths: list[Path] = []
+        created_paths: list[Path] = []
+        safe_design_num_id = re.sub(r"[^A-Za-z0-9_. -]", "_", design_num_id).strip(" .")
+        if not safe_design_num_id:
+            raise HTTPException(status_code=422, detail="DESIGN_NUM_ID cannot be used as a filename")
         try:
-            for upload in uploads:
+            for index, upload in enumerate(uploads):
                 suffix = Path(upload.filename or "image").suffix.lower()
                 if upload.content_type not in ALLOWED_IMAGE_TYPES or suffix not in ALLOWED_EXTENSIONS:
                     raise HTTPException(status_code=415, detail="Unsupported image type")
-                path = IMAGE_STORAGE_DIR / f"{uuid.uuid4().hex}{suffix}"
-                with path.open("wb") as destination:
-                    shutil.copyfileobj(upload.file, destination)
-                saved.append(path)
+                filename = f"{safe_design_num_id}{suffix}" if index == 0 else f"{uuid.uuid4().hex}{suffix}"
+                path = IMAGE_STORAGE_DIR / filename
+                if path.exists():
+                    upload_bytes = upload.file.read()
+                    upload.file.seek(0)
+                    if path.read_bytes() != upload_bytes:
+                        raise HTTPException(status_code=409, detail=f"Image already exists: {filename}")
+                else:
+                    with path.open("xb") as destination:
+                        created_paths.append(path)
+                        shutil.copyfileobj(upload.file, destination)
+                image_paths.append(path)
         except Exception:
-            DesignService._remove_files(saved)
+            DesignService._remove_files(created_paths)
             raise
-        return saved
+        return image_paths, created_paths
 
     @staticmethod
     def _remove_files(paths: list[Path]) -> None:
